@@ -63,10 +63,11 @@ Create a `.env` file in the project root with your API configurations.
 #### Option 1: Remote APIs (OpenAI, TogetherAI, etc.)
 
 ```bash
-# Primary API configuration
+# API Configuration for Data Generation
 API_KEY=your_api_key
 BASE_URL=your_base_url
 
+# API Configuration for Evaluation
 # Policy model configuration
 POLICY_API_KEY=your_policy_api_key
 POLICY_BASE_URL=your_policy_base_url
