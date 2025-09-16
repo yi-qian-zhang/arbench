@@ -1,0 +1,12 @@
+python3 -m arbench.reasoner.dc.dc_evaluator \
+    --method="zero_shot" \
+    --data_path="data/dc/test.json" \
+    --output_path="./results/dc_your_model.json" \
+    --policy_model="your_policy_model" \
+    --response_model="your_response_model" \
+    --branch=3 \
+    --max_turn=25 \
+    --policy_temperature=0.7 \
+    --policy_top_p=0.7 \
+    --response_temperature=0.7 \
+    --response_top_p=0.7

@@ -4,8 +4,8 @@
 METHOD="zero_shot"
 MAX_TURN=25
 BRANCH=3
-POLICY_MODEL="Qwen2.5-32B-Instruct"
-RESPONSE_MODEL="Qwen2.5-32B-Instruct"
+POLICY_MODEL="distill_r1_coing_neo_cleaned_uncertainty_threshold_40_sft_conversation_train_dataset"
+RESPONSE_MODEL="gpt-4o"
 POLICY_TEMPERATURE=0.7
 POLICY_TOP_P=0.7
 RESPONSE_TEMPERATURE=0.7

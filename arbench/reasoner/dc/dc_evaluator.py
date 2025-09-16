@@ -622,6 +622,10 @@ def main(
     with open(data_path, "r") as file:
         dataset = json.load(file)
 
+        # 先跑个demo
+        dataset = dataset[:1]
+        
+
     # Load existing logs if available
     logs = []
     if os.path.exists(output_path):
