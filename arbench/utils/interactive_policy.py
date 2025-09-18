@@ -5,17 +5,10 @@ import json
 from typing import Callable, Dict, List, Optional, Tuple
 import requests
 
+# 注意：不包含 </think>，否则会被提前截断
 STOP_TOKENS_DEFAULT = ["</asking>", "<｜end▁of▁sentence｜>"]
 
 def _normalize_base_url(base_url: str) -> str:
-    """
-    兼容以下输入：
-      - http://host:port
-      - http://host:port/v1
-      - http://host:port/v1/
-      - http://host:port/v1/chat/completions
-    最终统一成：.../v1/chat/completions
-    """
     u = (base_url or "").rstrip("/")
     if u.endswith("/chat/completions"):
         return u
@@ -23,7 +16,6 @@ def _normalize_base_url(base_url: str) -> str:
         return u + "/chat/completions"
     if u.endswith("/v1/"):
         return u + "chat/completions"
-    # 既没有 /v1 也没有 /chat/completions，就补成 /v1/chat/completions
     return u + "/v1/chat/completions"
 
 def _extract_between(s: str, left: str, right: str) -> Optional[str]:
@@ -31,22 +23,12 @@ def _extract_between(s: str, left: str, right: str) -> Optional[str]:
     return m.group(1).strip() if m else None
 
 def _extract_visible_after_think(s: str) -> str:
-    """
-    从 <think>…</think> 后截取“可见回复”。
-    若没有 </think>，退而求其次，返回整段去首尾空白。
-    """
+    # 最终返回“</think>之后的可见内容”；若没有 </think>，就返回整体（避免极端 prompt 下也能产出）
     if "</think>" in s:
         return s.split("</think>", 1)[1].strip()
     return s.strip()
 
 def infer_target_name(question: str, candidates: List[str], default_name: str = "") -> str:
-    """
-    解析 <asking> 中的问题要问谁。
-    策略：
-      1. 问题文本里若直接包含某个候选名字（大小写不敏感），匹配之。
-      2. 否则回落到 default_name（上一轮选中的嫌疑人）。
-      3. 实在不行返回 "UNKNOWN"。
-    """
     qlow = question.lower()
     for n in candidates:
         if n.lower() in qlow:
@@ -56,7 +38,6 @@ def infer_target_name(question: str, candidates: List[str], default_name: str = 
     return "UNKNOWN"
 
 class RespondRecorder:
-    """可选：记录 <think> 期间的中间问答，便于导出 """
     def __init__(self, system_prompts: Optional[Dict[str, str]] = None):
         self.logs = []
         self.system_prompts = system_prompts or {}
@@ -70,10 +51,12 @@ class RespondRecorder:
 
 class PolicyThinkRunner:
     """
-    让“策略模型”走 <think>/<asking>/<response> 循环。
-    其核心是：当生成遇到 stop token '</asking>' 时，取出 <asking>...，
-    通过 ask_router(question) 调用“用户模拟器/回复模型”得到 <response>，
-    把 <response> 填回 <think> 链，然后继续生成，直到生成出 </think> 后的最终可见答案。
+    原生续写版：
+    - 用 continue_final_message=True 从最后一条 assistant 内容处“接着写”；
+    - stop 只包含 </asking> 和模型的 EOS（不要放 </think>）；
+    - 命中 </asking> 就 ask_router 取答复，回填 <response>…</response>，继续写；
+    - 直到：模型自然停（EOS/finish_reason）或 max_completion_tokens 用完为止；
+    - 最终把 </think> 之后的“可见文本”返回（即使中途没遇到 </think>，也会返回当前累计）。
     """
     def __init__(
         self,
@@ -86,6 +69,8 @@ class PolicyThinkRunner:
         timeout: int = 60,
         max_retries: int = 3,
         retry_wait: int = 3,
+        max_completion_tokens: int = 4096,   # 单轮总预算
+        eos_aliases: Optional[List[str]] = None,  # 某些 vLLM 版本可能返回 'stop'/'length'
     ):
         self.base_url = _normalize_base_url(base_url)
         self.api_key = api_key or "none"
@@ -96,6 +81,11 @@ class PolicyThinkRunner:
         self.timeout = timeout
         self.max_retries = max_retries
         self.retry_wait = retry_wait
+        self.max_completion_tokens = max_completion_tokens
+        self.eos_aliases = set((eos_aliases or []) + ["stop", "length", None])
+
+        # 运行期变量
+        self._remaining_tokens = max_completion_tokens
 
     # ---------- HTTP ----------
     def _post(self, payload: dict) -> dict:
@@ -107,44 +97,60 @@ class PolicyThinkRunner:
         for attempt in range(1, self.max_retries + 1):
             try:
                 r = requests.post(self.base_url, headers=headers, data=json.dumps(payload), timeout=self.timeout)
-                # 如果后端是 vLLM，会返回 200 + OpenAI 兼容格式；404/5xx 则抛异常
                 r.raise_for_status()
                 return r.json()
             except Exception as e:
                 last_err = e
                 if attempt < self.max_retries:
                     time.sleep(self.retry_wait)
-        # 最后一次失败
-        if hasattr(last_err, "response") and getattr(last_err.response, "text", None):
-            raise RuntimeError(f"PolicyThinkRunner HTTP error: {last_err} | {last_err.response.text}")
-        raise RuntimeError(f"PolicyThinkRunner HTTP error: {last_err}")
 
-    def _chat_once(self, messages: List[Dict], add_assistant_prefix: str) -> Tuple[str, int, int, Optional[str]]:
-        """
-        发起一次补全。将 <think> 累积内容作为最后一条 assistant 消息传入，以便“续写”。
-        这里依赖 vLLM 的 `continue_final_message=True` 和 OpenAI 兼容接口。
-        返回：新增文本增量、输入token、输出token、stop_reason(如有)
-        """
+        detail = ""
+        if hasattr(last_err, "response") and getattr(last_err.response, "text", None):
+            detail = last_err.response.text
+        msg = f"PolicyThinkRunner HTTP error: {last_err}"
+        if detail:
+            msg += f" | {detail}"
+        if "continue_final_message is set" in detail:
+            msg += (
+                "\n\n[Fix Hint] 你的策略模型 chat_template 没有保留最后一条 assistant 内容。\n"
+                "为使用原生续写，请确保渲染后的最后一条消息是 role='assistant' 且内容不被模板吞掉。"
+            )
+        raise RuntimeError(msg)
+
+    def _chat_once(
+        self,
+        messages_before_assistant: List[Dict],
+        assistant_prefix: str
+    ) -> Tuple[str, int, int, Optional[str]]:
+        # 每次调用根据剩余额度设置 max_completion_tokens
+        # 有些 vLLM 版本用 max_tokens，为兼容你也可以加一行 payload["max_tokens"]=...
         payload = {
             "model": self.model,
-            "messages": messages + [{"role": "assistant", "content": add_assistant_prefix}],
+            "messages": messages_before_assistant + [
+                {"role": "assistant", "content": assistant_prefix}
+            ],
             "temperature": self.temperature,
             "top_p": self.top_p,
             "stop": self.stop_tokens,
-            # 下面这几个是 vLLM 扩展参数，OpenAI 官方会忽略，但 vLLM 会吃：
             "continue_final_message": True,
             "include_stop_str_in_output": True,
             "add_generation_prompt": False,
             "echo": False,
+            "max_completion_tokens": max(1, self._remaining_tokens),
         }
         data = self._post(payload)
         choice = data["choices"][0]
-        delta = choice["message"]["content"]
-        # vLLM 里字段可能叫 stop_reason（也可能是 finish_reason）
+        content = choice.get("message", {}).get("content", "") or ""
         stop_reason = choice.get("stop_reason", choice.get("finish_reason"))
-        in_tok = data.get("usage", {}).get("prompt_tokens", 0)
-        out_tok = data.get("usage", {}).get("completion_tokens", 0)
-        return delta, in_tok, out_tok, stop_reason
+
+        usage = data.get("usage", {}) or {}
+        in_tok = usage.get("prompt_tokens", 0)
+        out_tok = usage.get("completion_tokens", 0)
+
+        # 扣减剩余额度
+        self._remaining_tokens = max(0, self._remaining_tokens - int(out_tok or 0))
+
+        return content, in_tok, out_tok, stop_reason
 
     # ---------- Run Loop ----------
     def run(
@@ -156,54 +162,47 @@ class PolicyThinkRunner:
         default_target_name: str = "",
     ) -> Tuple[str, int, int]:
         """
-        history_until_assistant: 例如：[{"role":"system",...},{"role":"user",...}]，
-            也就是到“需要 assistant 说话”之前的上下文。
-        suspect_names: 可用来路由 <asking> 的目标人物。
-        ask_router:   真正把 <asking> 发给“回复模型(gpt-4o)”的回调。
-        返回：最终可见答案（</think> 之后的内容），累计输入token，累计输出token。
+        返回：(最终可见答案, 累计输入 token, 累计输出 token)
         """
         if recorder is None:
             recorder = RespondRecorder()
 
+        # 每次 run 重置预算（防止多轮调用共享旧值）
+        self._remaining_tokens = self.max_completion_tokens
+
         total_in, total_out = 0, 0
-        acc = "<think>\n"   # 累积 assistant 的“思考链”
+        completion = "<think>\n"  # 模型“思考草稿”累积（最后一条 assistant）
+
         while True:
-            delta, in_tok, out_tok, stop_reason = self._chat_once(history_until_assistant, acc)
+            if self._remaining_tokens <= 0:
+                # 预算耗尽，直接返回当前可见
+                return _extract_visible_after_think(completion), total_in, total_out
+
+            delta, in_tok, out_tok, stop_reason = self._chat_once(history_until_assistant, completion)
             total_in += in_tok
             total_out += out_tok
-            acc += delta
+            completion += delta
 
-            # 如果这一步“停在了 </asking>”，就触发“问用户模拟器”
-            # 1) vLLM 若设置 include_stop_str_in_output=True，content 里会包含 '</asking>'
-            # 2) 若没包含，也可以用 stop_reason 比较保险
-            hit_asking = ("</asking>" in acc) or (stop_reason == "</asking>")
+            # 命中 </asking> ：取问题 -> 调“用户模拟器” -> 回填 <response> -> 继续原生续写
+            hit_asking = ("</asking>" in completion) or (stop_reason == "</asking>")
             if hit_asking:
-                q = _extract_between(acc, "<asking>", "</asking>")
+                q = _extract_between(completion, "<asking>", "</asking>")
                 if q:
-                    # 路由到正确嫌疑人
                     target = infer_target_name(q, suspect_names, default_target_name)
                     if target == "UNKNOWN":
-                        # 给个兜底回答，避免死循环
                         target = default_target_name or (suspect_names[0] if suspect_names else "UNKNOWN")
-                    # 调用户模拟器（= 回复模型，比如 gpt-4o）
                     routed_target, a = ask_router(q)
-
-                    # 记录（可选）
                     recorder.record("assistant(thinking.asking)", q, {"target": routed_target})
                     recorder.record("user_simulator(response)", a, {"target": routed_target})
-
-                    # 把答复补回 <think> 链
-                    acc += f"\n<response>{a}</response>"
-                    # 继续 while 循环（再次调用策略模型续写）
+                    completion += f"\n<response>{a}</response>"
+                    # 不返回，继续 while 循环续写
                     continue
 
-            # 如果已经写完 </think>，就可以抽取最终可见答案返回了
-            if "</think>" in acc:
-                visible = _extract_visible_after_think(acc)
-                return visible, total_in, total_out
+            # 若不是 </asking> 打断，检查是否“自然停”或“长度停”
+            # vLLM 常见：stop_reason in {"stop","length",None}；或者匹配到 EOS（我们已把 EOS 放在 stop 里）
+            if stop_reason in self.eos_aliases or self._remaining_tokens <= 0:
+                return _extract_visible_after_think(completion), total_in, total_out
 
-            # 若遇到 “全停”(例如遇到 <｜end▁of▁sentence｜>) 却还没 </think>，
-            # 通常是提示不规范或模型异常，尽量返回当前可见片段，避免死循环。
+            # 保险：如果遇到未知 stop_reason，但不是 </asking>，也认为已停
             if stop_reason and stop_reason != "</asking>":
-                visible = _extract_visible_after_think(acc)
-                return visible, total_in, total_out
+                return _extract_visible_after_think(completion), total_in, total_out

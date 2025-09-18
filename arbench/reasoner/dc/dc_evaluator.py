@@ -884,7 +884,7 @@ def main(
         dataset = json.load(file)
 
         # 先跑个demo
-        dataset = dataset[:5]
+        dataset = dataset[:2]
         
 
     # Load existing logs if available
