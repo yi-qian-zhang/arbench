@@ -1,0 +1,1 @@
+python -m arbench.utils.eval_dc_accuracy /home/zhangyiqian/AR-Bench/results/r1_tagloop_new.json
