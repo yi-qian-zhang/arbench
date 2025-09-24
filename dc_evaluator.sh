@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=1 vllm serve /data2/chenxin/model_sft_results/distill-qwen-7b/full/distill_r1_coing_neo_cleaned_uncertainty_threshold_40_sft_conversation_train_dataset \
+CUDA_VISIBLE_DEVICES=0 vllm serve /data2/chenxin/model_sft_results/distill-qwen-7b/full/distill_r1_coing_neo_cleaned_uncertainty_threshold_40_sft_conversation_train_dataset \
     --api-key 123456  \
     --port 8722 \
     --gpu-memory-utilization 0.9 \
@@ -51,3 +51,16 @@ python -m arbench.reasoner.dc.dc_evaluator \
     --policy_top_p=0.7 \
     --response_temperature=0.7 \
     --response_top_p=0.7
+
+python -m arbench.reasoner.dc.dc_evaluator \
+    --method zero_shot \
+    --data_path data/dc/test.json \
+    --output_path ./results/dc_interactive_zero_shot.json \
+    --policy_model "distill_r1_coing_neo_cleaned_uncertainty_threshold_40_sft_conversation_train_dataset" \
+    --response_model "gpt-4o" \
+    --max_turn 25 \
+    --policy_temperature 0.6 \
+    --policy_top_p 0.95 \
+    --response_temperature 0.7 \
+    --response_top_p 0.7 \
+    --enable_interaction true

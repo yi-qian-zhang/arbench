@@ -27,8 +27,7 @@ from fire import Fire
 from dotenv import load_dotenv
 
 # new method
-from arbench.utils.interactive_policy import PolicyThinkRunner, RespondRecorder, infer_target_name
-
+from arbench.utils.interactive_policy_client import InteractivePolicyClient
 
 load_dotenv()
 
@@ -479,34 +478,34 @@ def _run_greedy_evaluation(
         with open(tree_path, "w", encoding="utf-8") as file:
             json.dump(tree_logs, file, indent=4)
 
-
-def _run_traditional_evaluation(
+def _run_traditional_evaluation_interactive(
     method: str,
     dataset: List[Dict],
     logs: List[Dict],
     output_path: str,
-    policy_model: str,
-    policy_temperature: float,
-    policy_top_p: float,
+    policy_client: InteractivePolicyClient,
     response_model: str,
     response_temperature: float,
     response_top_p: float,
     max_turn: int,
 ) -> None:
-    from arbench.utils.inference import inference
-
-    interactive_policy = (POLICY_BASE_URL is not None) and (POLICY_API_KEY is not None)
+    """使用交互式策略运行传统评估方法 (修改版：增加full_completions日志)"""
 
     for i in tqdm(range(len(logs), len(dataset))):
+        # 准备案例信息
         init_info = convert_initial_info_to_string(dataset[i]["initial_information"])
         label = dataset[i]["label"]
 
+        total_input_token, total_output_token = 0, 0
         choice_str = ", ".join([
             f"{index}. {item['name']}"
             for index, item in zip(ANSWER_CHOICES, dataset[i]["initial_information"]["suspect"])
         ])
 
-        # 每个嫌疑人的“用户模拟器”对话上下文（= response_model）
+        # 系统提示
+        system_content = METHOD_DICT[method].format(background=init_info, turn=max_turn)
+
+        # 初始化嫌疑人的响应代理
         response_agents = {
             item["name"]: [{
                 "role": "system",
@@ -516,245 +515,215 @@ def _run_traditional_evaluation(
             }]
             for item in dataset[i]["suspects"]
         }
-        suspect_name_list = [item["name"] for item in dataset[i]["initial_information"]["suspect"]]
-        suspect_name_str = ", ".join(suspect_name_list)
+        
+        suspect_name_str = ", ".join([
+            item["name"] for item in dataset[i]["initial_information"]["suspect"]
+        ])
 
-        # 仅用于记录 <think> 内部问答（导出可选）
-        recorder = RespondRecorder(system_prompts={n: response_agents[n][0]["content"] for n in response_agents.keys()})
-
+        # 存储完整对话记录
         propose_agent = [{
             "role": "system",
-            "content": METHOD_DICT[method].format(background=init_info, turn=max_turn),
+            "content": system_content,
         }]
+        
+        # --- 修改开始: 初始化日志列表 ---
+        all_interactions = []
+        all_completions = []  # <-- 1. 新增这个列表
+        # --- 修改结束 ---
 
-        total_input_token, total_output_token = 0, 0
-        last_chosen_suspect = ""
-
+        # 问答循环
         for turn in range(max_turn):
-            # ---- 选嫌疑人 ----
-            if interactive_policy:
-                runner = PolicyThinkRunner(
-                    base_url=POLICY_BASE_URL, api_key=POLICY_API_KEY, model=policy_model,
-                    temperature=policy_temperature, top_p=policy_top_p,
-                )
-                select_history = [
-                    {"role": "system", "content": METHOD_DICT[method].format(background=init_info, turn=max_turn)},
-                    {"role": "user", "content": select_suspect_template.format(turn=turn + 1, suspect_names=suspect_name_str)},
-                ]
-
-                def ask_router(q: str):
-                    target = infer_target_name(q, suspect_name_list, last_chosen_suspect)
-                    if target == "UNKNOWN":
-                        return "UNKNOWN", "I need the suspect's name to answer this."
-                    response_agents[target].append({"role": "user", "content": q})
-                    resp = inference(
-                        response_agents[target],
-                        model=response_model,
-                        temperature=response_temperature,
-                        top_p=response_top_p,
-                        api_key=RESPONSE_API_KEY,
-                        base_url=RESPONSE_BASE_URL,  # 对 gpt-4o：留空或官方 base_url
-                    )
-                    a = resp.choices[0].message.content
-                    response_agents[target].append({"role": "assistant", "content": a})
-                    return target, a
-
-                selected_suspect, in_tok, out_tok = runner.run(
-                    history_until_assistant=select_history,
-                    suspect_names=suspect_name_list,
-                    ask_router=ask_router,
-                    recorder=recorder,
-                    default_target_name=last_chosen_suspect,
-                )
-                total_input_token += in_tok
-                total_output_token += out_tok
-
-                selected_suspect = remove_punctuation_at_ends(selected_suspect)
-                if selected_suspect not in response_agents:
-                    selected_suspect = next(
-                        (n for n in suspect_name_list if n.lower() in selected_suspect.lower()),
-                        suspect_name_list[0]
-                    )
-                propose_agent.append({"role": "user", "content": select_suspect_template.format(turn=turn + 1, suspect_names=suspect_name_str)})
-                propose_agent.append({"role": "assistant", "content": selected_suspect})
-            else:
-                propose_agent.append({
-                    "role": "user",
-                    "content": select_suspect_template.format(turn=turn + 1, suspect_names=suspect_name_str),
-                })
-                resp = inference(
-                    propose_agent, model=policy_model,
-                    temperature=policy_temperature, top_p=policy_top_p,
-                    api_key=POLICY_API_KEY, base_url=POLICY_BASE_URL
-                )
-                selected_suspect = remove_punctuation_at_ends(resp.choices[0].message.content)
-                total_input_token += resp.usage.prompt_tokens
-                total_output_token += resp.usage.completion_tokens
-                if selected_suspect not in response_agents:
-                    propose_agent.append({"role": "assistant", "content": selected_suspect})
-                    propose_agent.append({"role": "user", "content": refine_select_suspect_prompt})
-                    continue
-                propose_agent.append({"role": "assistant", "content": selected_suspect})
-
-            last_chosen_suspect = selected_suspect
-
-            # ---- 生问题 ----
-            if interactive_policy:
-                runner_q = PolicyThinkRunner(
-                    base_url=POLICY_BASE_URL, api_key=POLICY_API_KEY, model=policy_model,
-                    temperature=policy_temperature, top_p=policy_top_p,
-                )
-                record_str = ""  # 可选：拼接历史 QA 做检索增强
-                ask_history = [
-                    {"role": "system", "content": propose_template.format(turn=max_turn, background=init_info)},
-                    {"role": "user", "content": question_propose_prompt_searching.format(record=record_str, suspect=selected_suspect)},
-                ]
-
-                def ask_router2(q: str):
-                    target = infer_target_name(q, suspect_name_list, selected_suspect)
-                    response_agents[target].append({"role": "user", "content": q})
-                    resp = inference(
-                        response_agents[target],
-                        model=response_model,
-                        temperature=response_temperature,
-                        top_p=response_top_p,
-                        api_key=RESPONSE_API_KEY,
-                        base_url=RESPONSE_BASE_URL,
-                    )
-                    a = resp.choices[0].message.content
-                    response_agents[target].append({"role": "assistant", "content": a})
-                    return target, a
-
-                question, in_tok, out_tok = runner_q.run(
-                    history_until_assistant=ask_history,
-                    suspect_names=suspect_name_list,
-                    ask_router=ask_router2,
-                    recorder=recorder,
-                    default_target_name=selected_suspect,
-                )
-                total_input_token += in_tok
-                total_output_token += out_tok
-
-                propose_agent.append({"role": "user", "content": question_propose_prompt.format(turn=turn + 1)})
-                propose_agent.append({"role": "assistant", "content": question})
-            else:
-                propose_agent.append({"role": "user", "content": question_propose_prompt.format(turn=turn + 1)})
-                resp = inference(
-                    propose_agent, model=policy_model,
-                    temperature=policy_temperature, top_p=policy_top_p,
-                    api_key=POLICY_API_KEY, base_url=POLICY_BASE_URL
-                )
-                question = resp.choices[0].message.content
-                total_input_token += resp.usage.prompt_tokens
-                total_output_token += resp.usage.completion_tokens
-                propose_agent.append({"role": "assistant", "content": question})
-
-            # ---- 正式记录“该问题”的可见回答（用户模拟器= response_model = gpt-4o）----
-            response_agents[selected_suspect].append({"role": "user", "content": question})
-            resp = inference(
-                response_agents[selected_suspect],
-                model=response_model,
-                temperature=response_temperature,
-                top_p=response_top_p,
-                api_key=RESPONSE_API_KEY,
-                base_url=RESPONSE_BASE_URL,
+            # 选择嫌疑人（使用交互）
+            select_prompt = select_suspect_template.format(
+                turn=turn + 1, suspect_names=suspect_name_str
             )
-            suspect_response = resp.choices[0].message.content
-            total_input_token += resp.usage.prompt_tokens
-            total_output_token += resp.usage.completion_tokens
-            response_agents[selected_suspect].append({"role": "assistant", "content": suspect_response})
+            
+            propose_agent.append({
+                "role": "user",
+                "content": select_prompt,
+            })
+            
+            # 获取之前的对话记录 (用于给响应模型提供上下文)
+            record_str = ""
+            for j, msg in enumerate(propose_agent):
+                if msg["role"] == "assistant" and j > 0:
+                    record_str += f"{msg['content']}\n"
+            
+            # 交互式选择嫌疑人
+            selected_suspect, suspect_completion, suspect_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
+                system_prompt=system_content,
+                user_prompt=select_prompt,
+                response_model=response_model,
+                response_api_key=RESPONSE_API_KEY,
+                response_base_url=RESPONSE_BASE_URL,
+                response_temperature=response_temperature,
+                response_top_p=response_top_p,
+                case_context={
+                    'case_info': init_info,
+                    'suspects': suspect_name_str,
+                    'turn': turn + 1,
+                    'record': record_str
+                }
+            )
+            
+            total_input_token += input_tok
+            total_output_token += output_tok
+            all_interactions.extend(suspect_interactions)
+            
+            # --- 修改开始: 记录完整的completion ---
+            all_completions.append({
+                "step": f"turn_{turn + 1}_select_suspect",
+                "completion": suspect_completion
+            })
+            # --- 修改结束 ---
+            
+            selected_suspect = remove_punctuation_at_ends(selected_suspect)
+            
+            # 验证嫌疑人
+            if selected_suspect not in response_agents.keys():
+                print(f"Invalid suspect: {selected_suspect}, retrying...")
+                propose_agent.append({"role": "assistant", "content": selected_suspect}) # 记录错误答案
+                propose_agent.append({"role": "user", "content": refine_select_suspect_prompt})
+                continue
+            
+            # (保持不变: 记录干净答案，以维持逻辑上下文)
+            propose_agent.append({"role": "assistant", "content": selected_suspect})
+            
+            # 生成问题（使用交互）
+            question_prompt = question_propose_prompt.format(turn=turn + 1)
+            propose_agent.append({
+                "role": "user",
+                "content": question_prompt,
+            })
+            
+            question, question_completion, question_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
+                system_prompt=system_content,
+                user_prompt=question_prompt,
+                response_model=response_model,
+                response_api_key=RESPONSE_API_KEY,
+                response_base_url=RESPONSE_BASE_URL,
+                response_temperature=response_temperature,
+                response_top_p=response_top_p,
+                case_context={
+                    'case_info': init_info,
+                    'suspect': selected_suspect,
+                    'turn': turn + 1,
+                    'record': record_str  # 传递之前的干净历史
+                }
+            )
+            
+            total_input_token += input_tok
+            total_output_token += output_tok
+            all_interactions.extend(question_interactions)
+            
+            # --- 修改开始: 记录完整的completion ---
+            all_completions.append({
+                "step": f"turn_{turn + 1}_generate_question",
+                "completion": question_completion
+            })
+            # --- 修改结束 ---
+            
+            # (保持不变: 记录干净问题，用于和模拟器交互)
+            propose_agent.append({"role": "assistant", "content": question})
 
+            # 获取嫌疑人回复（使用原始inference）
+            response_agents[selected_suspect].append({"role": "user", "content": question})
+            response = inference(
+                response_agents[selected_suspect], 
+                model=response_model, 
+                temperature=response_temperature, 
+                top_p=response_top_p, 
+                api_key=RESPONSE_API_KEY, 
+                base_url=RESPONSE_BASE_URL
+            )
+            suspect_response = response.choices[0].message.content
+            total_input_token += response.usage.prompt_tokens
+            total_output_token += response.usage.completion_tokens
+
+            response_agents[selected_suspect].append({"role": "assistant", "content": suspect_response})
+            # (保持不变: 记录干净的用户回复)
             propose_agent.append({"role": "user", "content": suspect_response})
 
-        # ---- 最终判案 ----
+        # 获取最终预测（使用交互）
+        final_prompt = select_murderer_template.format(choice=choice_str)
         propose_agent.append({
             "role": "user",
-            "content": select_murderer_template.format(choice=choice_str),
+            "content": final_prompt,
         })
+        
+        raw_pred, pred_completion, pred_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
+            system_prompt=system_content,
+            user_prompt=final_prompt,
+            response_model=response_model,
+            response_api_key=RESPONSE_API_KEY,
+            response_base_url=RESPONSE_BASE_URL,
+            response_temperature=response_temperature,
+            response_top_p=response_top_p,
+            case_context={
+                'case_info': init_info,
+                'choices': choice_str,
+                'record': record_str # 传递最后一次的历史记录
+            }
+        )
+        
+        total_input_token += input_tok
+        total_output_token += output_tok
+        all_interactions.extend(pred_interactions)
+        
+        # --- 修改开始: 记录完整的completion ---
+        all_completions.append({
+            "step": "final_prediction",
+            "completion": pred_completion
+        })
+        # --- 修改结束 ---
+        
+        # (保持不变: 记录最终裁减的答案)
+        propose_agent.append({"role": "assistant", "content": raw_pred})
 
-        if interactive_policy:
-            runner_decide = PolicyThinkRunner(
-                base_url=POLICY_BASE_URL, api_key=POLICY_API_KEY, model=policy_model,
-                temperature=policy_temperature, top_p=policy_top_p,
-            )
+        pred = CHOICE_TO_INDEX.get(extract_answer_choice(raw_pred), "")
+        if pred == "":
+            pred = CHOICE_TO_INDEX.get(extract_answer_choice(raw_pred.strip()), "") # 再次尝试
 
-            def ask_router_decide(q: str):
-                target = infer_target_name(q, suspect_name_list, "")
-                if target == "UNKNOWN":
-                    return "UNKNOWN", "No further details."
-                response_agents[target].append({"role": "user", "content": q})
-                resp = inference(
-                    response_agents[target],
-                    model=response_model,
-                    temperature=response_temperature,
-                    top_p=response_top_p,
-                    api_key=RESPONSE_API_KEY,
-                    base_url=RESPONSE_BASE_URL,
-                )
-                a = resp.choices[0].message.content
-                response_agents[target].append({"role": "assistant", "content": a})
-                return target, a
-
-            raw_pred, in_tok, out_tok = runner_decide.run(
-                history_until_assistant=propose_agent,
-                suspect_names=suspect_name_list,
-                ask_router=ask_router_decide,
-                recorder=recorder,
-            )
-            total_input_token += in_tok
-            total_output_token += out_tok
-            propose_agent.append({"role": "assistant", "content": raw_pred})
-        else:
-            resp = inference(
-                propose_agent, model=policy_model,
-                temperature=policy_temperature, top_p=policy_top_p,
-                api_key=POLICY_API_KEY, base_url=POLICY_BASE_URL
-            )
-            raw_pred = resp.choices[0].message.content
-            total_input_token += resp.usage.prompt_tokens
-            total_output_token += resp.usage.completion_tokens
-            propose_agent.append({"role": "assistant", "content": raw_pred})
-
-        pred = CHOICE_TO_INDEX[extract_answer_choice(raw_pred).strip()]
-
-        # —— 注意：这里导出 response_agents，包含所有问答（包含 <think> 期间的）——
-        respond_conversation = [
-            {"name": key, "conversation": value}
-            for key, value in response_agents.items()
-        ]
-
+        # --- 修改开始: 在最终日志中添加新键 ---
         logs.append({
             "idx": i,
-            "record": propose_agent,
-            "respond_conversation": respond_conversation,
+            "record": propose_agent,         # 干净的高层逻辑日志
+            "interactions": all_interactions, # 内部的 <asking>/<response> 日志
+            "full_completions": all_completions, # <--- 3. 你想要的带<think>的完整日志
+            "respond_conversation": [
+                {"name": key, "conversation": value}
+                for key, value in response_agents.items()
+            ],
             "pred": pred,
             "label": label,
             "round": max_turn,
-            "correctness": pred == label,
             "input_token_sum": total_input_token,
             "output_token_sum": total_output_token,
+            "correctness": pred == label,
         })
-
+        # --- 修改结束 ---
+        
+        # 保存结果
         with open(output_path, "w", encoding="utf-8") as file:
-            json.dump(logs, file, indent=4, ensure_ascii=False)
+            json.dump(logs, file, indent=4, ensure_ascii=False) # 添加 ensure_ascii=False 以防中文乱码
+        
+        print(f"Case {i}: Pred={pred}, Label={label}, Correct={pred==label}")
 
-# def _run_traditional_evaluation(
+# def _run_traditional_evaluation_interactive(
 #     method: str,
 #     dataset: List[Dict],
 #     logs: List[Dict],
 #     output_path: str,
-#     policy_model: str,
-#     policy_temperature: float,
-#     policy_top_p: float,
+#     policy_client: InteractivePolicyClient,
 #     response_model: str,
 #     response_temperature: float,
 #     response_top_p: float,
 #     max_turn: int,
 # ) -> None:
-#     """Run evaluation using traditional prompting methods."""
+#     """使用交互式策略运行传统评估方法"""
 
 #     for i in tqdm(range(len(logs), len(dataset))):
-#         # Prepare case information
+#         # 准备案例信息
 #         init_info = convert_initial_info_to_string(dataset[i]["initial_information"])
 #         label = dataset[i]["label"]
 
@@ -764,13 +733,10 @@ def _run_traditional_evaluation(
 #             for index, item in zip(ANSWER_CHOICES, dataset[i]["initial_information"]["suspect"])
 #         ])
 
-#         # Initialize conversation
-#         propose_agent = [{
-#             "role": "system",
-#             "content": METHOD_DICT[method].format(background=init_info, turn=max_turn),
-#         }]
+#         # 系统提示
+#         system_content = METHOD_DICT[method].format(background=init_info, turn=max_turn)
 
-#         # Initialize response agents for suspects
+#         # 初始化嫌疑人的响应代理
 #         response_agents = {
 #             item["name"]: [{
 #                 "role": "system",
@@ -785,74 +751,144 @@ def _run_traditional_evaluation(
 #             item["name"] for item in dataset[i]["initial_information"]["suspect"]
 #         ])
 
-#         # Question-answer loop
-#         for turn in range(max_turn):
-#             # Select suspect
-#             try:
-#                 propose_agent.append({
-#                     "role": "user",
-#                     "content": select_suspect_template.format(
-#                         turn=turn + 1, suspect_names=suspect_name_str
-#                     ),
-#                 })
-                
-#                 response = inference(propose_agent, model=policy_model, temperature=policy_temperature, top_p=policy_top_p, api_key=POLICY_API_KEY, base_url=POLICY_BASE_URL)
-#                 selected_suspect = response.choices[0].message.content
-#                 total_input_token += response.usage.prompt_tokens
-#                 total_output_token += response.usage.completion_tokens
-#                 selected_suspect = remove_punctuation_at_ends(selected_suspect)
+#         # 存储完整对话记录
+#         propose_agent = [{
+#             "role": "system",
+#             "content": system_content,
+#         }]
+#         all_interactions = []
 
-#                 assert selected_suspect in response_agents.keys(), \
-#                     f"{selected_suspect} is not in {response_agents.keys()}"
-                    
-#             except KeyboardInterrupt:
-#                 raise KeyboardInterrupt
-#             except:
+#         # 问答循环
+#         for turn in range(max_turn):
+#             # 选择嫌疑人（使用交互）
+#             select_prompt = select_suspect_template.format(
+#                 turn=turn + 1, suspect_names=suspect_name_str
+#             )
+            
+#             propose_agent.append({
+#                 "role": "user",
+#                 "content": select_prompt,
+#             })
+            
+#             # 获取之前的对话记录
+#             record_str = ""
+#             for j, msg in enumerate(propose_agent):
+#                 if msg["role"] == "assistant" and j > 0:
+#                     record_str += f"{msg['content']}\n"
+            
+#             # 交互式选择嫌疑人
+#             selected_suspect, suspect_completion, suspect_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
+#                 system_prompt=system_content,
+#                 user_prompt=select_prompt,
+#                 response_model=response_model,
+#                 response_api_key=RESPONSE_API_KEY,
+#                 response_base_url=RESPONSE_BASE_URL,
+#                 response_temperature=response_temperature,
+#                 response_top_p=response_top_p,
+#                 case_context={
+#                     'case_info': init_info,
+#                     'suspects': suspect_name_str,
+#                     'turn': turn + 1,
+#                     'record': record_str
+#                 }
+#             )
+            
+#             total_input_token += input_tok
+#             total_output_token += output_tok
+#             all_interactions.extend(suspect_interactions)
+            
+#             selected_suspect = remove_punctuation_at_ends(selected_suspect)
+            
+#             # 验证嫌疑人
+#             if selected_suspect not in response_agents.keys():
+#                 print(f"Invalid suspect: {selected_suspect}, retrying...")
 #                 propose_agent.append({"role": "assistant", "content": selected_suspect})
 #                 propose_agent.append({"role": "user", "content": refine_select_suspect_prompt})
 #                 continue
-
-#             # Ask question to suspect
+            
 #             propose_agent.append({"role": "assistant", "content": selected_suspect})
+            
+#             # 生成问题（使用交互）
+#             question_prompt = question_propose_prompt.format(turn=turn + 1)
 #             propose_agent.append({
 #                 "role": "user",
-#                 "content": question_propose_prompt.format(turn=turn + 1),
+#                 "content": question_prompt,
 #             })
             
-#             response = inference(propose_agent, model=policy_model, temperature=policy_temperature, top_p=policy_top_p, api_key=POLICY_API_KEY, base_url=POLICY_BASE_URL)
-#             question = response.choices[0].message.content
-#             total_input_token += response.usage.prompt_tokens
-#             total_output_token += response.usage.completion_tokens
+#             question, question_completion, question_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
+#                 system_prompt=system_content,
+#                 user_prompt=question_prompt,
+#                 response_model=response_model,
+#                 response_api_key=RESPONSE_API_KEY,
+#                 response_base_url=RESPONSE_BASE_URL,
+#                 response_temperature=response_temperature,
+#                 response_top_p=response_top_p,
+#                 case_context={
+#                     'case_info': init_info,
+#                     'suspect': selected_suspect,
+#                     'turn': turn + 1,
+#                     'record': record_str
+#                 }
+#             )
+            
+#             total_input_token += input_tok
+#             total_output_token += output_tok
+#             all_interactions.extend(question_interactions)
+            
+#             propose_agent.append({"role": "assistant", "content": question})
 
-#             # Get suspect response
+#             # 获取嫌疑人回复（使用原始inference）
 #             response_agents[selected_suspect].append({"role": "user", "content": question})
-#             response = inference(response_agents[selected_suspect], model=response_model, temperature=response_temperature, top_p=response_top_p, api_key=RESPONSE_API_KEY, base_url=RESPONSE_BASE_URL)
+#             response = inference(
+#                 response_agents[selected_suspect], 
+#                 model=response_model, 
+#                 temperature=response_temperature, 
+#                 top_p=response_top_p, 
+#                 api_key=RESPONSE_API_KEY, 
+#                 base_url=RESPONSE_BASE_URL
+#             )
 #             suspect_response = response.choices[0].message.content
 #             total_input_token += response.usage.prompt_tokens
 #             total_output_token += response.usage.completion_tokens
 
 #             response_agents[selected_suspect].append({"role": "assistant", "content": suspect_response})
-
-#             propose_agent.append({"role": "assistant", "content": question})
 #             propose_agent.append({"role": "user", "content": suspect_response})
 
-#         # Get final prediction
+#         # 获取最终预测（使用交互）
+#         final_prompt = select_murderer_template.format(choice=choice_str)
 #         propose_agent.append({
 #             "role": "user",
-#             "content": select_murderer_template.format(choice=choice_str),
+#             "content": final_prompt,
 #         })
         
-#         response = inference(propose_agent, model=policy_model, temperature=policy_temperature, top_p=policy_top_p, api_key=POLICY_API_KEY, base_url=POLICY_BASE_URL)
-#         raw_pred = response.choices[0].message.content
-#         total_input_token += response.usage.prompt_tokens
-#         total_output_token += response.usage.completion_tokens
-
-#         pred = CHOICE_TO_INDEX[extract_answer_choice(raw_pred).strip()]
+#         raw_pred, pred_completion, pred_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
+#             system_prompt=system_content,
+#             user_prompt=final_prompt,
+#             response_model=response_model,
+#             response_api_key=RESPONSE_API_KEY,
+#             response_base_url=RESPONSE_BASE_URL,
+#             response_temperature=response_temperature,
+#             response_top_p=response_top_p,
+#             case_context={
+#                 'case_info': init_info,
+#                 'choices': choice_str
+#             }
+#         )
+        
+#         total_input_token += input_tok
+#         total_output_token += output_tok
+#         all_interactions.extend(pred_interactions)
+        
 #         propose_agent.append({"role": "assistant", "content": raw_pred})
+
+#         pred = CHOICE_TO_INDEX.get(extract_answer_choice(raw_pred), "")
+#         if pred == "":
+#             pred = CHOICE_TO_INDEX.get(extract_answer_choice(raw_pred.strip()), "")
 
 #         logs.append({
 #             "idx": i,
 #             "record": propose_agent,
+#             "interactions": all_interactions,
 #             "respond_conversation": [
 #                 {"name": key, "conversation": value}
 #                 for key, value in response_agents.items()
@@ -860,53 +896,67 @@ def _run_traditional_evaluation(
 #             "pred": pred,
 #             "label": label,
 #             "round": max_turn,
+#             "input_token_sum": total_input_token,
+#             "output_token_sum": total_output_token,
 #             "correctness": pred == label,
 #         })
         
+#         # 保存结果
 #         with open(output_path, "w", encoding="utf-8") as file:
 #             json.dump(logs, file, indent=4)
-
+        
+#         print(f"Case {i}: Pred={pred}, Label={label}, Correct={pred==label}")
 
 def main(
-    method: str, 
-    data_path: str, 
-    output_path: str, 
-    policy_model: str,
-    response_model: str,
-    max_turn: int = 25, 
-    branch: int = 3,
-    policy_temperature: float = 0.7,
-    policy_top_p: float = 0.7,
+    method: str = "zero_shot",
+    data_path: str = "/home/zhangyiqian/AR-Bench/data/dc/test.json", 
+    output_path: str = "results/dc_interactive_zero_shot.json", 
+    policy_model: str = "distill_r1_coing_neo_cleaned_uncertainty_threshold_40_sft_conversation_train_dataset",
+    policy_url: str = "http://localhost:8722/v1/",
+    response_model: str = "gpt-4o",
+    max_turn: int = 25,
+    policy_temperature: float = 0.6,
+    policy_top_p: float = 0.95,
     response_temperature: float = 0.7,
-    response_top_p: float = 0.7
+    response_top_p: float = 0.7,
+    enable_interaction: bool = True
 ) -> None:
+    
     with open(data_path, "r") as file:
         dataset = json.load(file)
+        # 测试时只跑第一个
+        dataset = dataset[:1]
 
-        # 先跑个demo
-        dataset = dataset[:2]
-        
-
-    # Load existing logs if available
+    # 加载已有日志
     logs = []
     if os.path.exists(output_path):
         with open(output_path, "r") as file:
             logs = json.load(file)
 
-    print(f"Policy Model: {policy_model}, Response Model: {response_model}")
+    print(f"Policy Model: {policy_model} (Interactive: {enable_interaction})")
+    print(f"Policy URL: {policy_url}")
+    print(f"Response Model: {response_model}")
     print(f"Policy Temperature: {policy_temperature}, Policy Top_p: {policy_top_p}")
     print(f"Response Temperature: {response_temperature}, Response Top_p: {response_top_p}")
     print(f"Max turn: {max_turn}, Method: {method}")
 
-    if method == "greedy":
-        _run_greedy_evaluation(dataset, logs, output_path, policy_model, max_turn, branch, 
-                              policy_temperature, policy_top_p, response_model,
-                              response_temperature, response_top_p)
+    if enable_interaction:
+        # 使用交互式Policy客户端
+        policy_client = InteractivePolicyClient(
+            model_path=policy_model,
+            base_url=policy_url,
+            api_key=POLICY_API_KEY,
+            temperature=policy_temperature,
+            top_p=policy_top_p
+        )
+        
+        _run_traditional_evaluation_interactive(
+            method, dataset, logs, output_path, policy_client,
+            response_model, response_temperature, response_top_p, max_turn
+        )
     else:
-        _run_traditional_evaluation(method, dataset, logs, output_path, policy_model,
-                                   policy_temperature, policy_top_p, response_model,
-                                   response_temperature, response_top_p, max_turn)
-
+        print("Non-interactive mode not implemented in this version")
+        print("Please use the original AR-bench code for non-interactive evaluation")
 
 if __name__ == "__main__":
     Fire(main)
