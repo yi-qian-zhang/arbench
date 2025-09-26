@@ -3,6 +3,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 import requests
 import json
+import time
 
 class InteractivePolicyClient:
     """处理distill模型的交互式问答"""
@@ -22,10 +23,10 @@ class InteractivePolicyClient:
         self.api_key = api_key
         self.temperature = temperature
         self.top_p = top_p
-        self.max_tokens = max_tokens
         self.timeout = timeout
-        self.completion = ""
         self.stop_reason = None
+        self.completion = "<think>\n"
+        self.completion_tokens = max_tokens
         
     def generate_with_interaction(
         self, 
@@ -38,74 +39,47 @@ class InteractivePolicyClient:
         response_top_p: float = 0.7,
         case_context: Dict = None
     ) -> Tuple[str, str, List[Dict], int, int]:
-
-        # 初始化completion，以<think>开始
+        """
+        生成带交互的回答
+        返回: (最终答案, 完整completion, 交互历史, input_tokens, output_tokens)
+        """
+        
+        # 重置状态
         self.completion = "<think>\n"
+        self.completion_tokens = 4096
+        self.stop_reason = None
+        
+        interaction_history = []
+        total_input_tokens = 0
+        total_output_tokens = 0
+        
+        # 构建初始消息
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
             {"role": "assistant", "content": self.completion}
         ]
         
-        interaction_history = []
-        total_input_tokens = 0
-        total_output_tokens = 0
-        
-        # 调用distill模型
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
-        }
-        
-        payload = {
-            "model": self.model_path,
-            "messages": messages,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            # "stop": ["</asking>", "<｜end▁of▁sentence｜>"],  生成完
-            "stop": ["</asking>", "</think>"],
-            "max_completion_tokens": self.max_tokens,
-            "add_generation_prompt": False,
-            "continue_final_message": True,
-            "include_stop_str_in_output": True,
-            "echo": False
-        }
-        
-        try:
-            response = requests.post(
-                url=self.base_url,
-                headers=headers,
-                data=json.dumps(payload),
-                timeout=self.timeout
-            )
-            response_json = response.json()
-            
-            model_response = response_json['choices'][0]['message']['content']
-            self.completion += model_response
-            self.stop_reason = response_json['choices'][0].get('stop_reason', 
-                                response_json['choices'][0].get('finish_reason'))
-            
-            total_input_tokens += response_json['usage']['prompt_tokens']
-            total_output_tokens += response_json['usage']['completion_tokens']
-            
-            # 检查stop token
-            if "</asking>" in model_response:
-                self.stop_reason = "</asking>"
-            
-        except Exception as e:
-            print(f"Error calling distill model: {e}")
+        # 调用模型
+        model_response = self._chat(messages)
+        if model_response is None:
             return user_prompt, self.completion, [], 0, 0
+            
+        # 更新token计数
+        usage = model_response.get('usage', {})
+        total_input_tokens += usage.get('prompt_tokens', 0)
+        total_output_tokens += usage.get('completion_tokens', 0)
         
-        # 交互循环
+        # 交互循环 - 跟你的代码一样简单
         while self.stop_reason == "</asking>":
-            # 提取助手的询问
-            ask_match = re.search(r"<asking>(.*?)</asking>", model_response, re.DOTALL)
+            # 提取asking内容
+            ask_match = re.search(r"<asking>(.*?)</asking>", self.completion, re.DOTALL)
             if not ask_match:
                 break
                 
             ask_content = ask_match.group(1).strip()
             
-            # 使用GPT-4O生成回复
+            # 调用GPT-4O获取回复
             gpt_response = self._get_gpt_response(
                 ask_content, 
                 case_context,
@@ -122,7 +96,7 @@ class InteractivePolicyClient:
                 "response": gpt_response
             })
             
-            # 把response插入think继续生成
+            # 添加response继续生成
             self.completion += f"\n<response>{gpt_response}</response>\n"
             messages = [
                 {"role": "system", "content": system_prompt},
@@ -130,40 +104,75 @@ class InteractivePolicyClient:
                 {"role": "assistant", "content": self.completion}
             ]
             
-            payload["messages"] = messages
-            payload["max_completion_tokens"] = self.max_tokens - total_output_tokens
-            
-            try:
-                response = requests.post(
-                    url=self.base_url,
-                    headers=headers,
-                    data=json.dumps(payload),
-                    timeout=self.timeout
-                )
-                response_json = response.json()
-                
-                model_response = response_json['choices'][0]['message']['content']
-                self.completion += model_response
-                self.stop_reason = response_json['choices'][0].get('stop_reason',
-                                    response_json['choices'][0].get('finish_reason'))
-                
-                if "</asking>" in model_response:
-                    self.stop_reason = "</asking>"
-                
-                total_input_tokens += response_json['usage']['prompt_tokens']
-                total_output_tokens += response_json['usage']['completion_tokens']
-                
-            except Exception as e:
-                print(f"Error in interaction loop: {e}")
+            # 继续调用模型
+            model_response = self._chat(messages)
+            if model_response is None:
                 break
+                
+            # 更新token计数
+            usage = model_response.get('usage', {})
+            total_input_tokens += usage.get('prompt_tokens', 0)
+            total_output_tokens += usage.get('completion_tokens', 0)
         
-        # 确保completion以</think>结尾并提取最终答案
+        # 确保completion以</think>结尾
         if "</think>" not in self.completion:
             self.completion += "\n</think>\n"
         
-        final_answer = self._extract_final_answer(self.completion)
+        # 提取最终答案
+        final_answer = self._extract_final_answer(self.completion, user_prompt)
         
         return final_answer, self.completion, interaction_history, total_input_tokens, total_output_tokens
+    
+    def _chat(self, messages):
+        """发送聊天请求 - 基于你的ModelClient.chat()"""
+         # 调用distill模型
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key or 'none'}"
+        }
+        
+        payload = {
+            "model": self.model_path,
+            "messages": messages,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "stop": ["</asking>", "<｜end▁of▁sentence｜>"],
+            "max_tokens": self.completion_tokens,
+            "add_generation_prompt": False,
+            "continue_final_message": True,
+            "include_stop_str_in_output": True,
+            "echo": False
+        }
+        
+        try:
+            response = requests.post(
+                url=self.base_url,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=self.timeout
+            )
+            
+            if response.status_code == 200:
+                results = response.json()
+                
+                # 更新状态 - 跟你的代码一样
+                self.stop_reason = results['choices'][0].get('stop_reason', None)
+                new_content = results['choices'][0]['message']['content']
+                self.completion += new_content
+                
+                # 更新剩余tokens
+                completion_tokens_used = results['usage']['completion_tokens']
+                self.completion_tokens -= completion_tokens_used
+                self.completion_tokens = max(1, self.completion_tokens)
+                
+                return results
+            else:
+                print(f"HTTP Error {response.status_code}: {response.text}")
+                return None
+                
+        except Exception as e:
+            print(f"Error calling model: {e}")
+            return None
     
     def _get_gpt_response(
         self, 
@@ -175,36 +184,19 @@ class InteractivePolicyClient:
         temperature: float,
         top_p: float
     ) -> str:
-        """使用GPT-4O生成对侦探询问的回复"""
+        """使用GPT-4O生成回复"""
         from arbench.utils.inference import inference
         
-        # 构建GPT的系统提示
-        gpt_system = """你是一个协助侦探破案的助手。侦探会询问你关于案件调查策略的建议。
-        请根据案件背景提供简洁、有用的建议，帮助侦探更好地进行调查。
-        你的回答应该：
-        1. 简洁明了，1-2句话
-        2. 基于案件事实和逻辑推理
-        3. 提供具体可行的建议"""
+        # 简单的系统提示
+        gpt_system = """You are an assistant who helps detectives solve cases. Please provide concise and useful suggestions based on the questions."""
         
-        # 构建上下文信息
-        case_info = ""
-        if context:
-            if 'case_info' in context:
-                case_info = f"案件背景：{context['case_info']}\n"
-            if 'suspect' in context:
-                case_info += f"当前讨论的嫌疑人：{context['suspect']}\n"
-            if 'turn' in context:
-                case_info += f"当前是第{context['turn']}轮询问\n"
-            if 'record' in context and context['record']:
-                case_info += f"已有调查记录：{context['record'][:200]}...\n"
-        
+        # 构建消息
         gpt_messages = [
             {"role": "system", "content": gpt_system},
-            {"role": "user", "content": f"{case_info}\n侦探的问题：{question}"}
+            {"role": "user", "content": f"The detective's question:{question}"}
         ]
         
         try:
-            # 调用GPT-4O
             response = inference(
                 gpt_messages, 
                 model=response_model,
@@ -214,74 +206,19 @@ class InteractivePolicyClient:
                 base_url=base_url
             )
             
-            # --- 新增的健壮性检查 ---
-            if (response and response.choices and 
-                response.choices[0].message and 
-                response.choices[0].message.content):
-                
+            if response and response.choices and response.choices[0].message:
                 return response.choices[0].message.content.strip()
             else:
-                # API调用失败, 返回空, 或被内容过滤
-                print(f"警告: 响应模型 (GPT-4O) 返回了无效内容。")
-                print(f"API 响应详情: {response}")
-                return "我目前无法回答这个问题。" # 返回一个安全的默认字符串
-
+                return "Unable to generate a response"
+                
         except Exception as e:
-            print(f"错误: 调用响应模型 (GPT-4O) 失败: {e}")
-            return "调用响应模型时出错。"
-    # def _get_gpt_response(
-    #     self, 
-    #     question: str, 
-    #     context: Dict,
-    #     response_model: str,
-    #     api_key: str,
-    #     base_url: str,
-    #     temperature: float,
-    #     top_p: float
-    # ) -> str:
-    #     """使用GPT-4O生成对侦探询问的回复"""
-    #     from arbench.utils.inference import inference
-        
-    #     # 构建GPT的系统提示
-    #     gpt_system = """你是一个协助侦探破案的助手。侦探会询问你关于案件调查策略的建议。
-    #     请根据案件背景提供简洁、有用的建议，帮助侦探更好地进行调查。
-    #     你的回答应该：
-    #     1. 简洁明了，1-2句话
-    #     2. 基于案件事实和逻辑推理
-    #     3. 提供具体可行的建议"""
-        
-    #     # 构建上下文信息
-    #     case_info = ""
-    #     if context:
-    #         if 'case_info' in context:
-    #             case_info = f"案件背景：{context['case_info']}\n"
-    #         if 'suspect' in context:
-    #             case_info += f"当前讨论的嫌疑人：{context['suspect']}\n"
-    #         if 'turn' in context:
-    #             case_info += f"当前是第{context['turn']}轮询问\n"
-    #         if 'record' in context and context['record']:
-    #             case_info += f"已有调查记录：{context['record'][:200]}...\n"
-        
-    #     gpt_messages = [
-    #         {"role": "system", "content": gpt_system},
-    #         {"role": "user", "content": f"{case_info}\n侦探的问题：{question}"}
-    #     ]
-        
-    #     # 调用GPT-4O
-    #     response = inference(
-    #         gpt_messages, 
-    #         model=response_model,
-    #         temperature=temperature,
-    #         top_p=top_p,
-    #         api_key=api_key,
-    #         base_url=base_url
-    #     )
-        
-    #     return response.choices[0].message.content.strip()
+            print(f"Error calling GPT: {e}")
+            return "Call failed"
     
-    def _extract_final_answer(self, completion: str) -> str:
-        """从completion中提取最终答案"""
-        # 提取</think>之后的内容
+    def _extract_final_answer(self, completion: str, user_prompt: str = "") -> str:
+        """Extract the final answer from "completion""""
+        
+        # 首先尝试提取</think>之后的内容
         if "</think>" in completion:
             parts = completion.split("</think>")
             if len(parts) > 1:
@@ -289,14 +226,31 @@ class InteractivePolicyClient:
                 if final_part:
                     return final_part
         
-        # 如果没有</think>之后的内容，尝试提取最后的有效内容
-        lines = completion.strip().split('\n')
-        for line in reversed(lines):
-            line = line.strip()
-            # 跳过标签和空行
-            if line and not line.startswith('<') and not line.startswith('</'):
-                # 这可能是最终答案
-                return line
+        # 如果没有，从think内容中提取最后一个有意义的内容
+        if "<think>" in completion:
+            think_content = completion.split("<think>")[1]
+            if "</think>" in think_content:
+                think_content = think_content.split("</think>")[0]
+            
+            # 根据prompt类型智能提取
+            if "choose a suspect" in user_prompt.lower():
+                # 查找人名模式
+                name_pattern = r'((?:Mr\.|Ms\.|Dr\.|Professor|Mrs\.) [A-Z][a-z]+ [A-Z][a-z]+)'
+                matches = re.findall(name_pattern, think_content)
+                if matches:
+                    return matches[-1]  # 返回最后提到的名字
+            
+            elif "give your question" in user_prompt.lower():
+                # 查找问句
+                questions = re.findall(r'[A-Z][^?]*\?', think_content)
+                if questions:
+                    return questions[-1].strip()
+            
+            elif "true murderer" in user_prompt.lower():
+                # 查找答案
+                answer_match = re.search(r'\b([A-E])\b', think_content)
+                if answer_match:
+                    return answer_match.group(1)
         
-        # 默认返回一个简单答案
-        return "无法确定"
+        # 默认返回
+        return completion.strip().split('\n')[-1] if completion.strip() else "unidentified"
