@@ -478,7 +478,8 @@ def _run_greedy_evaluation(
         with open(tree_path, "w", encoding="utf-8") as file:
             json.dump(tree_logs, file, indent=4)
 
-def _run_traditional_evaluation_interactive(
+
+def _run_traditional_evaluation_interactive_simplified(
     method: str,
     dataset: List[Dict],
     logs: List[Dict],
@@ -489,7 +490,7 @@ def _run_traditional_evaluation_interactive(
     response_top_p: float,
     max_turn: int,
 ) -> None:
-    """使用交互式策略运行传统评估方法 (修改版：增加full_completions日志)"""
+    """使用交互式策略运行传统评估方法 - 简化版：只关注完整生成，不做提取"""
 
     for i in tqdm(range(len(logs), len(dataset))):
         # 准备案例信息
@@ -526,10 +527,8 @@ def _run_traditional_evaluation_interactive(
             "content": system_content,
         }]
         
-        # --- 修改开始: 初始化日志列表 ---
         all_interactions = []
         all_completions = []
-        # --- 修改结束 ---
 
         # 问答循环
         for turn in range(max_turn):
@@ -543,16 +542,14 @@ def _run_traditional_evaluation_interactive(
                 "content": select_prompt,
             })
             
-            # 获取之前的对话记录 (用于给响应模型提供上下文)
+            # 获取之前的对话记录
             record_str = ""
             for j, msg in enumerate(propose_agent):
                 if msg["role"] == "assistant" and j > 0:
-                    # **MODIFICATION**: Use the full completion for context if available
-                    # This gives the model its own thought process back.
                     record_str += f"{msg['content']}\n"
             
-            # 交互式选择嫌疑人
-            selected_suspect, suspect_completion, suspect_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
+            # 交互式选择嫌疑人 - 返回完整的推理过程
+            suspect_full_response, suspect_completion, suspect_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
                 system_prompt=system_content,
                 user_prompt=select_prompt,
                 response_model=response_model,
@@ -577,20 +574,8 @@ def _run_traditional_evaluation_interactive(
                 "completion": suspect_completion
             })
             
-            # Use the clean extracted name for logic, but the full completion for logging
-            selected_suspect_clean = remove_punctuation_at_ends(selected_suspect)
-            
-            # 验证嫌疑人
-            if selected_suspect_clean not in response_agents.keys():
-                print(f"Invalid suspect: {selected_suspect_clean}, retrying...")
-                # Log the full, incorrect completion
-                propose_agent.append({"role": "assistant", "content": suspect_completion}) 
-                propose_agent.append({"role": "user", "content": refine_select_suspect_prompt})
-                continue
-            
-            # --- ✨ KEY CHANGE 1 ---
-            # Log the full completion instead of just the clean answer
-            propose_agent.append({"role": "assistant", "content": suspect_completion})
+            # 记录完整的推理过程 - 不做提取，直接保存
+            propose_agent.append({"role": "assistant", "content": suspect_full_response})
             
             # 生成问题（使用交互）
             question_prompt = question_propose_prompt.format(turn=turn + 1)
@@ -599,7 +584,7 @@ def _run_traditional_evaluation_interactive(
                 "content": question_prompt,
             })
             
-            question, question_completion, question_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
+            question_full_response, question_completion, question_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
                 system_prompt=system_content,
                 user_prompt=question_prompt,
                 response_model=response_model,
@@ -609,7 +594,7 @@ def _run_traditional_evaluation_interactive(
                 response_top_p=response_top_p,
                 case_context={
                     'case_info': init_info,
-                    'suspect': selected_suspect_clean,
+                    'suspect': "TBD",  # 暂时不提取嫌疑人
                     'turn': turn + 1,
                     'record': record_str
                 }
@@ -624,14 +609,18 @@ def _run_traditional_evaluation_interactive(
                 "completion": question_completion
             })
             
-            # --- ✨ KEY CHANGE 2 ---
-            # Log the full completion for the question
-            propose_agent.append({"role": "assistant", "content": question_completion})
+            # 记录完整的推理过程 - 不做提取，直接保存
+            propose_agent.append({"role": "assistant", "content": question_full_response})
 
-            # 获取嫌疑人回复（使用原始inference）
-            response_agents[selected_suspect_clean].append({"role": "user", "content": question})
+            # 暂时跳过嫌疑人回复，因为我们还没有提取问题的逻辑
+            # 这里可以先用一个默认问题或者跳过这个步骤
+            default_question = "What can you tell me about this case?"
+            
+            # 获取嫌疑人回复（使用第一个嫌疑人作为默认）
+            first_suspect = list(response_agents.keys())[0]
+            response_agents[first_suspect].append({"role": "user", "content": default_question})
             response = inference(
-                response_agents[selected_suspect_clean], 
+                response_agents[first_suspect], 
                 model=response_model, 
                 temperature=response_temperature, 
                 top_p=response_top_p, 
@@ -642,7 +631,7 @@ def _run_traditional_evaluation_interactive(
             total_input_token += response.usage.prompt_tokens
             total_output_token += response.usage.completion_tokens
 
-            response_agents[selected_suspect_clean].append({"role": "assistant", "content": suspect_response})
+            response_agents[first_suspect].append({"role": "assistant", "content": suspect_response})
             propose_agent.append({"role": "user", "content": suspect_response})
 
         # 获取最终预测（使用交互）
@@ -652,7 +641,7 @@ def _run_traditional_evaluation_interactive(
             "content": final_prompt,
         })
         
-        raw_pred, pred_completion, pred_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
+        prediction_full_response, pred_completion, pred_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
             system_prompt=system_content,
             user_prompt=final_prompt,
             response_model=response_model,
@@ -676,13 +665,11 @@ def _run_traditional_evaluation_interactive(
             "completion": pred_completion
         })
         
-        # --- ✨ KEY CHANGE 3 ---
-        # Log the final full completion
-        propose_agent.append({"role": "assistant", "content": pred_completion})
+        # 记录完整的推理过程 - 不做提取，直接保存
+        propose_agent.append({"role": "assistant", "content": prediction_full_response})
 
-        pred = CHOICE_TO_INDEX.get(extract_answer_choice(raw_pred), "")
-        if pred == "":
-            pred = CHOICE_TO_INDEX.get(extract_answer_choice(raw_pred.strip()), "")
+        # 暂时不提取pred，设为空或者使用原来的extract_answer_choice函数
+        pred = ""  # 或者可以保留原来的: CHOICE_TO_INDEX.get(extract_answer_choice(prediction_full_response), "")
 
         logs.append({
             "idx": i,
@@ -698,246 +685,22 @@ def _run_traditional_evaluation_interactive(
             "round": max_turn,
             "input_token_sum": total_input_token,
             "output_token_sum": total_output_token,
-            "correctness": pred == label,
+            "correctness": pred == label if pred != "" else False,
+            "raw_prediction_reasoning": prediction_full_response,  # 保存完整推理用于后续分析
         })
         
         # 保存结果
         with open(output_path, "w", encoding="utf-8") as file:
             json.dump(logs, file, indent=4, ensure_ascii=False)
         
-        print(f"Case {i}: Pred={pred}, Label={label}, Correct={pred==label}")
-# def _run_traditional_evaluation_interactive(
-#     method: str,
-#     dataset: List[Dict],
-#     logs: List[Dict],
-#     output_path: str,
-#     policy_client: InteractivePolicyClient,
-#     response_model: str,
-#     response_temperature: float,
-#     response_top_p: float,
-#     max_turn: int,
-# ) -> None:
-#     """使用交互式策略运行传统评估方法"""
-
-#     for i in tqdm(range(len(logs), len(dataset))):
-#         # 准备案例信息
-#         init_info = convert_initial_info_to_string(dataset[i]["initial_information"])
-#         label = dataset[i]["label"]
-
-#         total_input_token, total_output_token = 0, 0
-#         choice_str = ", ".join([
-#             f"{index}. {item['name']}"
-#             for index, item in zip(ANSWER_CHOICES, dataset[i]["initial_information"]["suspect"])
-#         ])
-
-#         # 系统提示
-#         system_content = METHOD_DICT[method].format(background=init_info, turn=max_turn)
-
-#         # 初始化嫌疑人的响应代理
-#         response_agents = {
-#             item["name"]: [{
-#                 "role": "system",
-#                 "content": respond_template.format(
-#                     name=item["name"], task=item["task"], story=item["story"]
-#                 ),
-#             }]
-#             for item in dataset[i]["suspects"]
-#         }
-        
-#         suspect_name_str = ", ".join([
-#             item["name"] for item in dataset[i]["initial_information"]["suspect"]
-#         ])
-
-#         # 存储完整对话记录
-#         propose_agent = [{
-#             "role": "system",
-#             "content": system_content,
-#         }]
-        
-#         all_interactions = []
-#         all_completions = []
-
-#         # 问答循环
-#         for turn in range(max_turn):
-#             # 选择嫌疑人
-#             select_prompt = select_suspect_template.format(
-#                 turn=turn + 1, suspect_names=suspect_name_str
-#             )
-            
-#             propose_agent.append({
-#                 "role": "user",
-#                 "content": select_prompt,
-#             })
-            
-#             # 交互式选择嫌疑人
-#             selected_suspect, suspect_completion, suspect_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
-#                 system_prompt=system_content,
-#                 user_prompt=select_prompt,
-#                 response_model=response_model,
-#                 response_api_key=RESPONSE_API_KEY,
-#                 response_base_url=RESPONSE_BASE_URL,
-#                 response_temperature=response_temperature,
-#                 response_top_p=response_top_p,
-#                 case_context={
-#                     'case_info': init_info,
-#                     'suspects': suspect_name_str,
-#                     'turn': turn + 1
-#                 }
-#             )
-            
-#             total_input_token += input_tok
-#             total_output_token += output_tok
-#             all_interactions.extend(suspect_interactions)
-#             all_completions.append({
-#                 "step": f"turn_{turn + 1}_select_suspect",
-#                 "completion": suspect_completion
-#             })
-            
-#             selected_suspect = remove_punctuation_at_ends(selected_suspect)
-            
-#             # 验证嫌疑人 - 如果无效，使用refine prompt重试
-#             retry_count = 0
-#             while selected_suspect not in response_agents.keys() and retry_count < 2:
-#                 propose_agent.append({"role": "assistant", "content": selected_suspect})
-#                 propose_agent.append({"role": "user", "content": refine_select_suspect_prompt})
-                
-#                 selected_suspect, suspect_completion, suspect_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
-#                     system_prompt=system_content,
-#                     user_prompt=refine_select_suspect_prompt,
-#                     response_model=response_model,
-#                     response_api_key=RESPONSE_API_KEY,
-#                     response_base_url=RESPONSE_BASE_URL,
-#                     response_temperature=response_temperature,
-#                     response_top_p=response_top_p,
-#                     case_context={'suspects': suspect_name_str}
-#                 )
-                
-#                 total_input_token += input_tok
-#                 total_output_token += output_tok
-#                 selected_suspect = remove_punctuation_at_ends(selected_suspect)
-#                 retry_count += 1
-            
-#             # 如果还是无效，跳过这轮
-#             if selected_suspect not in response_agents.keys():
-#                 print(f"Failed to get valid suspect after retries, skipping turn {turn + 1}")
-#                 continue
-            
-#             propose_agent.append({"role": "assistant", "content": selected_suspect})
-            
-#             # 生成问题
-#             question_prompt = question_propose_prompt.format(turn=turn + 1)
-#             propose_agent.append({
-#                 "role": "user",
-#                 "content": question_prompt,
-#             })
-            
-#             question, question_completion, question_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
-#                 system_prompt=system_content,
-#                 user_prompt=question_prompt,
-#                 response_model=response_model,
-#                 response_api_key=RESPONSE_API_KEY,
-#                 response_base_url=RESPONSE_BASE_URL,
-#                 response_temperature=response_temperature,
-#                 response_top_p=response_top_p,
-#                 case_context={
-#                     'case_info': init_info,
-#                     'suspect': selected_suspect,
-#                     'turn': turn + 1
-#                 }
-#             )
-            
-#             total_input_token += input_tok
-#             total_output_token += output_tok
-#             all_interactions.extend(question_interactions)
-#             all_completions.append({
-#                 "step": f"turn_{turn + 1}_generate_question",
-#                 "completion": question_completion
-#             })
-            
-#             propose_agent.append({"role": "assistant", "content": question})
-
-#             # 获取嫌疑人回复
-#             response_agents[selected_suspect].append({"role": "user", "content": question})
-#             response = inference(
-#                 response_agents[selected_suspect], 
-#                 model=response_model, 
-#                 temperature=response_temperature, 
-#                 top_p=response_top_p, 
-#                 api_key=RESPONSE_API_KEY, 
-#                 base_url=RESPONSE_BASE_URL
-#             )
-#             suspect_response = response.choices[0].message.content
-#             total_input_token += response.usage.prompt_tokens
-#             total_output_token += response.usage.completion_tokens
-
-#             response_agents[selected_suspect].append({"role": "assistant", "content": suspect_response})
-#             propose_agent.append({"role": "user", "content": suspect_response})
-
-#         # 获取最终预测
-#         final_prompt = select_murderer_template.format(choice=choice_str)
-#         propose_agent.append({
-#             "role": "user",
-#             "content": final_prompt,
-#         })
-        
-#         raw_pred, pred_completion, pred_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
-#             system_prompt=system_content,
-#             user_prompt=final_prompt,
-#             response_model=response_model,
-#             response_api_key=RESPONSE_API_KEY,
-#             response_base_url=RESPONSE_BASE_URL,
-#             response_temperature=response_temperature,
-#             response_top_p=response_top_p,
-#             case_context={
-#                 'case_info': init_info,
-#                 'choices': choice_str
-#             }
-#         )
-        
-#         total_input_token += input_tok
-#         total_output_token += output_tok
-#         all_interactions.extend(pred_interactions)
-#         all_completions.append({
-#             "step": "final_prediction",
-#             "completion": pred_completion
-#         })
-        
-#         propose_agent.append({"role": "assistant", "content": raw_pred})
-
-#         # 提取预测结果
-#         pred = CHOICE_TO_INDEX.get(extract_answer_choice(raw_pred), "")
-#         if pred == "":
-#             pred = CHOICE_TO_INDEX.get(extract_answer_choice(raw_pred.strip()), "")
-
-#         # 保存日志
-#         logs.append({
-#             "idx": i,
-#             "record": propose_agent,
-#             "interactions": all_interactions,
-#             "full_completions": all_completions,
-#             "respond_conversation": [
-#                 {"name": key, "conversation": value}
-#                 for key, value in response_agents.items()
-#             ],
-#             "pred": pred,
-#             "label": label,
-#             "round": max_turn,
-#             "input_token_sum": total_input_token,
-#             "output_token_sum": total_output_token,
-#             "correctness": pred == label,
-#         })
-        
-#         # 保存结果
-#         with open(output_path, "w", encoding="utf-8") as file:
-#             json.dump(logs, file, indent=4, ensure_ascii=False)
-        
-#         print(f"Case {i}: Pred={pred}, Label={label}, Correct={pred==label}")
+        print(f"Case {i}: Reasoning length: {len(prediction_full_response)} characters")
+        print(f"Interactions: {len(all_interactions)}")
 
 
 def main(
     method: str = "zero_shot",
     data_path: str = "/home/zhangyiqian/AR-Bench/data/dc/test.json", 
-    output_path: str = "results/dc_interactive_zero_shot.json", 
+    output_path: str = "results/dc_interactive_zero_shot_simplified.json", 
     policy_model: str = "distill_r1_coing_neo_cleaned_uncertainty_threshold_40_sft_conversation_train_dataset",
     policy_url: str = "http://localhost:8722/v1/",
     response_model: str = "gpt-4o",
@@ -949,7 +712,7 @@ def main(
     enable_interaction: bool = True
 ) -> None:
     """
-    主函数 - 运行交互式犯罪检测评估
+    主函数 - 运行交互式犯罪检测评估 (简化版：只关注完整生成)
     """
     
     # 加载数据
@@ -966,7 +729,7 @@ def main(
         print(f"Loaded {len(logs)} existing results from {output_path}")
 
     print("="*50)
-    print("Configuration:")
+    print("Configuration (Simplified - Focus on Complete Generation):")
     print(f"  Method: {method}")
     print(f"  Policy Model: {policy_model}")
     print(f"  Policy URL: {policy_url}")
@@ -980,7 +743,7 @@ def main(
     print("="*50)
 
     if enable_interaction:
-        # 使用交互式Policy客户端
+        # 使用简化版的交互式Policy客户端
         policy_client = InteractivePolicyClient(
             model_path=policy_model,
             base_url=policy_url,
@@ -990,7 +753,8 @@ def main(
             max_tokens=4096
         )
         
-        _run_traditional_evaluation_interactive(
+        # 运行简化版的评估函数
+        _run_traditional_evaluation_interactive_simplified(
             method=method,
             dataset=dataset,
             logs=logs,
@@ -1002,19 +766,11 @@ def main(
             max_turn=max_turn
         )
         
-        # 计算并打印最终准确率
-        if logs:
-            correct_count = sum(1 for log in logs if log.get("correctness", False))
-            accuracy = correct_count / len(logs) * 100
-            print("="*50)
-            print(f"Final Results:")
-            print(f"  Total Cases: {len(logs)}")
-            print(f"  Correct: {correct_count}")
-            print(f"  Accuracy: {accuracy:.2f}%")
-            print("="*50)
+        print("="*50)
+        print(f"Processing completed - check output file for full reasoning processes")
+        print("="*50)
     else:
         print("Non-interactive mode not implemented in this version")
-        print("Please use the original AR-bench code for non-interactive evaluation")
 
 if __name__ == "__main__":
     Fire(main)

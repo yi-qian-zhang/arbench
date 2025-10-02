@@ -1,11 +1,11 @@
-# interactive_policy_client.py
+# interactive_policy_client_v1.py
 import re
 from typing import Dict, List, Optional, Tuple
 import requests
 import json
 
 class InteractivePolicyClient:
-    """处理distill模型的交互式问答"""
+    """处理distill模型的交互式问答 - 简化版：让模型完整生成直到自然结束"""
     
     def __init__(
         self, 
@@ -14,7 +14,7 @@ class InteractivePolicyClient:
         api_key: str = "none",
         temperature: float = 0.6,
         top_p: float = 0.95,
-        max_tokens: int = 4096,
+        max_tokens: int = 1024,
         timeout: int = 60
     ):
         self.model_path = model_path
@@ -62,7 +62,7 @@ class InteractivePolicyClient:
             "messages": messages,
             "temperature": self.temperature,
             "top_p": self.top_p,
-            "stop": ["</asking>", "<｜end▁of▁sentence｜>"], 
+            "stop": ["</asking>", "<｜end▁of▁sentence｜>"],  # 关键：不包含</think>
             "max_completion_tokens": self.max_tokens,
             "add_generation_prompt": False,
             "continue_final_message": True,
@@ -156,13 +156,9 @@ class InteractivePolicyClient:
                 print(f"Error in interaction loop: {e}")
                 break
         
-        # 确保completion以</think>结尾并提取最终答案
-        if "</think>" not in self.completion:
-            self.completion += "\n</think>\n"
-        
-        final_answer = self._extract_final_answer(self.completion)
-        
-        return final_answer, self.completion, interaction_history, total_input_tokens, total_output_tokens
+        # 关键修改：直接返回完整的completion，不做任何提取
+        # 模型应该生成：<think>...</think>[最终答案] 然后自然停止
+        return self.completion, self.completion, interaction_history, total_input_tokens, total_output_tokens
     
     def _get_gpt_response(
         self, 
@@ -213,41 +209,15 @@ class InteractivePolicyClient:
                 base_url=base_url
             )
             
-            # --- 新增的健壮性检查 ---
             if (response and response.choices and 
                 response.choices[0].message and 
                 response.choices[0].message.content):
                 
                 return response.choices[0].message.content.strip()
             else:
-                # API调用失败, 返回空, 或被内容过滤
                 print(f"警告: 响应模型 (GPT-4O) 返回了无效内容。")
-                print(f"API 响应详情: {response}")
-                return "我目前无法回答这个问题。" # 返回一个安全的默认字符串
+                return "我目前无法回答这个问题。"
 
         except Exception as e:
             print(f"错误: 调用响应模型 (GPT-4O) 失败: {e}")
             return "调用响应模型时出错。"
-    
-    
-    def _extract_final_answer(self, completion: str) -> str:
-        """从completion中提取最终答案"""
-        # 提取</think>之后的内容
-        if "</think>" in completion:
-            parts = completion.split("</think>")
-            if len(parts) > 1:
-                final_part = parts[1].strip()
-                if final_part:
-                    return final_part
-        
-        # 如果没有</think>之后的内容，尝试提取最后的有效内容
-        lines = completion.strip().split('\n')
-        for line in reversed(lines):
-            line = line.strip()
-            # 跳过标签和空行
-            if line and not line.startswith('<') and not line.startswith('</'):
-                # 这可能是最终答案
-                return line
-        
-        # 默认返回一个简单答案
-        return "无法确定"

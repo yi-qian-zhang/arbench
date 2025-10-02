@@ -26,8 +26,8 @@ from arbench.utils.utils_dc import (
 from fire import Fire
 from dotenv import load_dotenv
 
-# new method
-from arbench.utils.interactive_policy_client_v1 import InteractivePolicyClient
+# new method  自己写的方法
+from arbench.utils.interactive_policy_client_v3 import InteractivePolicyClient
 
 load_dotenv()
 
@@ -478,6 +478,10 @@ def _run_greedy_evaluation(
         with open(tree_path, "w", encoding="utf-8") as file:
             json.dump(tree_logs, file, indent=4)
 
+
+
+
+###以下是改动部分 上面没动
 def _run_traditional_evaluation_interactive(
     method: str,
     dataset: List[Dict],
@@ -505,6 +509,25 @@ def _run_traditional_evaluation_interactive(
         # 系统提示
         system_content = METHOD_DICT[method].format(background=init_info, turn=max_turn)
 
+        system_content += """
+
+        OUTPUT FORMAT EXAMPLES:
+
+        Example 1 - When selecting a suspect:
+        <think>
+        Based on the evidence, I should question Dr. Langley.
+        </think>
+        Dr. Margaret Langley
+
+        Example 2 - When asking a question:
+        <think>
+        I need to know about his alibi.
+        </think>
+        Where were you at 8 PM?
+
+        NEVER add explanations after </think>. Just output the direct answer.
+        """
+
         # 初始化嫌疑人的响应代理
         response_agents = {
             item["name"]: [{
@@ -531,7 +554,7 @@ def _run_traditional_evaluation_interactive(
         all_completions = []
         # --- 修改结束 ---
 
-        # 问答循环
+        # User Prompt
         for turn in range(max_turn):
             # 选择嫌疑人（使用交互）
             select_prompt = select_suspect_template.format(
@@ -588,7 +611,6 @@ def _run_traditional_evaluation_interactive(
                 propose_agent.append({"role": "user", "content": refine_select_suspect_prompt})
                 continue
             
-            # --- ✨ KEY CHANGE 1 ---
             # Log the full completion instead of just the clean answer
             propose_agent.append({"role": "assistant", "content": suspect_completion})
             
@@ -624,7 +646,6 @@ def _run_traditional_evaluation_interactive(
                 "completion": question_completion
             })
             
-            # --- ✨ KEY CHANGE 2 ---
             # Log the full completion for the question
             propose_agent.append({"role": "assistant", "content": question_completion})
 
@@ -676,7 +697,6 @@ def _run_traditional_evaluation_interactive(
             "completion": pred_completion
         })
         
-        # --- ✨ KEY CHANGE 3 ---
         # Log the final full completion
         propose_agent.append({"role": "assistant", "content": pred_completion})
 
@@ -706,232 +726,6 @@ def _run_traditional_evaluation_interactive(
             json.dump(logs, file, indent=4, ensure_ascii=False)
         
         print(f"Case {i}: Pred={pred}, Label={label}, Correct={pred==label}")
-# def _run_traditional_evaluation_interactive(
-#     method: str,
-#     dataset: List[Dict],
-#     logs: List[Dict],
-#     output_path: str,
-#     policy_client: InteractivePolicyClient,
-#     response_model: str,
-#     response_temperature: float,
-#     response_top_p: float,
-#     max_turn: int,
-# ) -> None:
-#     """使用交互式策略运行传统评估方法"""
-
-#     for i in tqdm(range(len(logs), len(dataset))):
-#         # 准备案例信息
-#         init_info = convert_initial_info_to_string(dataset[i]["initial_information"])
-#         label = dataset[i]["label"]
-
-#         total_input_token, total_output_token = 0, 0
-#         choice_str = ", ".join([
-#             f"{index}. {item['name']}"
-#             for index, item in zip(ANSWER_CHOICES, dataset[i]["initial_information"]["suspect"])
-#         ])
-
-#         # 系统提示
-#         system_content = METHOD_DICT[method].format(background=init_info, turn=max_turn)
-
-#         # 初始化嫌疑人的响应代理
-#         response_agents = {
-#             item["name"]: [{
-#                 "role": "system",
-#                 "content": respond_template.format(
-#                     name=item["name"], task=item["task"], story=item["story"]
-#                 ),
-#             }]
-#             for item in dataset[i]["suspects"]
-#         }
-        
-#         suspect_name_str = ", ".join([
-#             item["name"] for item in dataset[i]["initial_information"]["suspect"]
-#         ])
-
-#         # 存储完整对话记录
-#         propose_agent = [{
-#             "role": "system",
-#             "content": system_content,
-#         }]
-        
-#         all_interactions = []
-#         all_completions = []
-
-#         # 问答循环
-#         for turn in range(max_turn):
-#             # 选择嫌疑人
-#             select_prompt = select_suspect_template.format(
-#                 turn=turn + 1, suspect_names=suspect_name_str
-#             )
-            
-#             propose_agent.append({
-#                 "role": "user",
-#                 "content": select_prompt,
-#             })
-            
-#             # 交互式选择嫌疑人
-#             selected_suspect, suspect_completion, suspect_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
-#                 system_prompt=system_content,
-#                 user_prompt=select_prompt,
-#                 response_model=response_model,
-#                 response_api_key=RESPONSE_API_KEY,
-#                 response_base_url=RESPONSE_BASE_URL,
-#                 response_temperature=response_temperature,
-#                 response_top_p=response_top_p,
-#                 case_context={
-#                     'case_info': init_info,
-#                     'suspects': suspect_name_str,
-#                     'turn': turn + 1
-#                 }
-#             )
-            
-#             total_input_token += input_tok
-#             total_output_token += output_tok
-#             all_interactions.extend(suspect_interactions)
-#             all_completions.append({
-#                 "step": f"turn_{turn + 1}_select_suspect",
-#                 "completion": suspect_completion
-#             })
-            
-#             selected_suspect = remove_punctuation_at_ends(selected_suspect)
-            
-#             # 验证嫌疑人 - 如果无效，使用refine prompt重试
-#             retry_count = 0
-#             while selected_suspect not in response_agents.keys() and retry_count < 2:
-#                 propose_agent.append({"role": "assistant", "content": selected_suspect})
-#                 propose_agent.append({"role": "user", "content": refine_select_suspect_prompt})
-                
-#                 selected_suspect, suspect_completion, suspect_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
-#                     system_prompt=system_content,
-#                     user_prompt=refine_select_suspect_prompt,
-#                     response_model=response_model,
-#                     response_api_key=RESPONSE_API_KEY,
-#                     response_base_url=RESPONSE_BASE_URL,
-#                     response_temperature=response_temperature,
-#                     response_top_p=response_top_p,
-#                     case_context={'suspects': suspect_name_str}
-#                 )
-                
-#                 total_input_token += input_tok
-#                 total_output_token += output_tok
-#                 selected_suspect = remove_punctuation_at_ends(selected_suspect)
-#                 retry_count += 1
-            
-#             # 如果还是无效，跳过这轮
-#             if selected_suspect not in response_agents.keys():
-#                 print(f"Failed to get valid suspect after retries, skipping turn {turn + 1}")
-#                 continue
-            
-#             propose_agent.append({"role": "assistant", "content": selected_suspect})
-            
-#             # 生成问题
-#             question_prompt = question_propose_prompt.format(turn=turn + 1)
-#             propose_agent.append({
-#                 "role": "user",
-#                 "content": question_prompt,
-#             })
-            
-#             question, question_completion, question_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
-#                 system_prompt=system_content,
-#                 user_prompt=question_prompt,
-#                 response_model=response_model,
-#                 response_api_key=RESPONSE_API_KEY,
-#                 response_base_url=RESPONSE_BASE_URL,
-#                 response_temperature=response_temperature,
-#                 response_top_p=response_top_p,
-#                 case_context={
-#                     'case_info': init_info,
-#                     'suspect': selected_suspect,
-#                     'turn': turn + 1
-#                 }
-#             )
-            
-#             total_input_token += input_tok
-#             total_output_token += output_tok
-#             all_interactions.extend(question_interactions)
-#             all_completions.append({
-#                 "step": f"turn_{turn + 1}_generate_question",
-#                 "completion": question_completion
-#             })
-            
-#             propose_agent.append({"role": "assistant", "content": question})
-
-#             # 获取嫌疑人回复
-#             response_agents[selected_suspect].append({"role": "user", "content": question})
-#             response = inference(
-#                 response_agents[selected_suspect], 
-#                 model=response_model, 
-#                 temperature=response_temperature, 
-#                 top_p=response_top_p, 
-#                 api_key=RESPONSE_API_KEY, 
-#                 base_url=RESPONSE_BASE_URL
-#             )
-#             suspect_response = response.choices[0].message.content
-#             total_input_token += response.usage.prompt_tokens
-#             total_output_token += response.usage.completion_tokens
-
-#             response_agents[selected_suspect].append({"role": "assistant", "content": suspect_response})
-#             propose_agent.append({"role": "user", "content": suspect_response})
-
-#         # 获取最终预测
-#         final_prompt = select_murderer_template.format(choice=choice_str)
-#         propose_agent.append({
-#             "role": "user",
-#             "content": final_prompt,
-#         })
-        
-#         raw_pred, pred_completion, pred_interactions, input_tok, output_tok = policy_client.generate_with_interaction(
-#             system_prompt=system_content,
-#             user_prompt=final_prompt,
-#             response_model=response_model,
-#             response_api_key=RESPONSE_API_KEY,
-#             response_base_url=RESPONSE_BASE_URL,
-#             response_temperature=response_temperature,
-#             response_top_p=response_top_p,
-#             case_context={
-#                 'case_info': init_info,
-#                 'choices': choice_str
-#             }
-#         )
-        
-#         total_input_token += input_tok
-#         total_output_token += output_tok
-#         all_interactions.extend(pred_interactions)
-#         all_completions.append({
-#             "step": "final_prediction",
-#             "completion": pred_completion
-#         })
-        
-#         propose_agent.append({"role": "assistant", "content": raw_pred})
-
-#         # 提取预测结果
-#         pred = CHOICE_TO_INDEX.get(extract_answer_choice(raw_pred), "")
-#         if pred == "":
-#             pred = CHOICE_TO_INDEX.get(extract_answer_choice(raw_pred.strip()), "")
-
-#         # 保存日志
-#         logs.append({
-#             "idx": i,
-#             "record": propose_agent,
-#             "interactions": all_interactions,
-#             "full_completions": all_completions,
-#             "respond_conversation": [
-#                 {"name": key, "conversation": value}
-#                 for key, value in response_agents.items()
-#             ],
-#             "pred": pred,
-#             "label": label,
-#             "round": max_turn,
-#             "input_token_sum": total_input_token,
-#             "output_token_sum": total_output_token,
-#             "correctness": pred == label,
-#         })
-        
-#         # 保存结果
-#         with open(output_path, "w", encoding="utf-8") as file:
-#             json.dump(logs, file, indent=4, ensure_ascii=False)
-        
-#         print(f"Case {i}: Pred={pred}, Label={label}, Correct={pred==label}")
 
 
 def main(
